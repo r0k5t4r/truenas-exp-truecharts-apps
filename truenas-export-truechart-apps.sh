@@ -150,9 +150,6 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
   chart_version=$($YQ_BIN e '.chart.version // ""' "$cleaned_file")
   app_version=$($YQ_BIN e '.appVersion // ""' "$cleaned_file")
 
-  port=$($YQ_BIN e '.service.main.ports.main.port // 8080' "$cleaned_file")
-  target_port=$($YQ_BIN e '.service.main.ports.main.targetPort // 8080' "$cleaned_file")
-
   echo "  - Generating docker-compose for $ns/$release..."
   {
     echo "version: '3.8'"
@@ -160,28 +157,79 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     echo "  $release:"
     echo "    image: ${image}:${tag}"
     echo "    container_name: $release"
-    echo "    ports:"
-    echo "      - \"$port:$target_port\""
-    echo "    volumes:"
   } > "$out_compose"
+
+  # --- PORTS ---
+  ports_list=()
+  num_ports=$($YQ_BIN e '.portForwardingList | length' "$cleaned_file" 2>/dev/null || echo 0)
+  if [[ "$num_ports" -gt 0 ]]; then
+    for i in $(seq 0 $((num_ports - 1))); do
+      containerPort=$($YQ_BIN e ".portForwardingList[$i].containerPort" "$cleaned_file")
+      nodePort=$($YQ_BIN e ".portForwardingList[$i].nodePort" "$cleaned_file")
+      protocol=$($YQ_BIN e ".portForwardingList[$i].protocol" "$cleaned_file" | tr '[:upper:]' '[:lower:]')
+
+      if [[ "$protocol" == "udp" ]]; then
+        ports_list+=("\"$nodePort:$containerPort/udp\"")
+      else
+        ports_list+=("\"$nodePort:$containerPort\"")
+      fi
+    done
+  else
+    # fallback to main port
+    port=$($YQ_BIN e '.service.main.ports.main.port // 8080' "$cleaned_file")
+    target_port=$($YQ_BIN e '.service.main.ports.main.targetPort // 8080' "$cleaned_file")
+    ports_list+=("\"$port:$target_port\"")
+  fi
+
+  echo "    ports:" >> "$out_compose"
+  for p in "${ports_list[@]}"; do
+    echo "      - $p" >> "$out_compose"
+  done
+
+  # --- VOLUMES ---
+  echo "    volumes:" >> "$out_compose"
 
   declare -A seen=()
   hostpaths_list=()
 
-  # Recursively find all hostPath values in cleaned.yaml (non-null, unique)
-  mapfile -t all_hostpaths < <($YQ_BIN e '.. | select(has("hostPath")) | .hostPath' "$cleaned_file" | grep -v 'null' || true)
+  # 1. persistence volumes
+  if [[ "$($YQ_BIN e 'has("persistence")' "$cleaned_file")" == "true" ]]; then
+    mapfile -t keys < <($YQ_BIN e '.persistence | keys | .[]' "$cleaned_file" | sed 's/"//g')
+    for key in "${keys[@]}"; do
+      enabled=$($YQ_BIN e ".persistence.\"$key\".enabled // false" "$cleaned_file")
+      hostPath=$($YQ_BIN e ".persistence.\"$key\".hostPath // \"\"" "$cleaned_file")
+      mountPath=$($YQ_BIN e ".persistence.\"$key\".mountPath // \"\"" "$cleaned_file")
+      if [[ "$enabled" == "true" && -n "$hostPath" && "$hostPath" != "null" && "$mountPath" != "null" && -z "${seen[$hostPath]+x}" ]]; then
+        echo "      - \"$hostPath:$mountPath\"" >> "$out_compose"
+        seen[$hostPath]=1
+        hostpaths_list+=("$hostPath")
+      fi
+    done
+  fi
 
+  # 2. hostPathVolumes array
+  num_hostpath_volumes=$($YQ_BIN e '.hostPathVolumes | length' "$cleaned_file" 2>/dev/null || echo 0)
+  if [[ "$num_hostpath_volumes" -gt 0 ]]; then
+    for i in $(seq 0 $((num_hostpath_volumes - 1))); do
+      hostPath=$($YQ_BIN e ".hostPathVolumes[$i].hostPath // \"\"" "$cleaned_file")
+      mountPath=$($YQ_BIN e ".hostPathVolumes[$i].mountPath // \"\"" "$cleaned_file")
+      if [[ -n "$hostPath" && "$hostPath" != "null" && "$mountPath" != "null" && -z "${seen[$hostPath]+x}" ]]; then
+        echo "      - \"$hostPath:$mountPath\"" >> "$out_compose"
+        seen[$hostPath]=1
+        hostpaths_list+=("$hostPath")
+      fi
+    done
+  fi
+
+  # 3. any other hostPaths anywhere else in YAML
+  mapfile -t all_hostpaths < <($YQ_BIN e '.. | select(has("hostPath")) | .hostPath' "$cleaned_file" | grep -v 'null' || true)
   for path in "${all_hostpaths[@]}"; do
     path_trimmed=$(echo "$path" | xargs)
     if [[ -n "$path_trimmed" && -z "${seen[$path_trimmed]+x}" ]]; then
+      echo "      - \"$path_trimmed:$path_trimmed\"" >> "$out_compose"
       seen[$path_trimmed]=1
       hostpaths_list+=("$path_trimmed")
     fi
-  done
-
-  # Add volumes to docker-compose.yaml mapping hostPath to hostPath (simple)
-  for hp in "${hostpaths_list[@]}"; do
-    echo "      - \"$hp:$hp\"" >> "$out_compose"
   done
 
   echo "    restart: unless-stopped" >> "$out_compose"
