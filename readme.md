@@ -101,3 +101,14 @@ This script and the migration process are also documented in [my blog post](http
 
 MIT — use freely, contributions welcome!
 
+---
+
+## ⚠️ Disclaimer
+
+This script is provided **as is**, without any warranties or guarantees.  
+I take **no responsibility** for any data loss, misconfiguration, or downtime caused by the use of this tool.  
+Please test it in a safe environment and make sure to **back up** your TrueNAS system before running it.
+
+Use at your own risk.
+
+
