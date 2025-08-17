@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # CONFIGURATION
+export KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
 EXPORT_DIR="/root/scripts/truenas-exp-truecharts-apps/exports"
 YQ_BIN="./bin/yq"
 KUBECTL_BIN="k3s kubectl"
@@ -10,7 +11,7 @@ HELM_BIN="helm"
 BACKUP_HOSTPATHS=false
 EXPORT_K8S_RESOURCES=true
 PG_DUMP_ENABLED=true
-GENERATE_ONLY=${GENERATE_ONLY:-true}
+GENERATE_ONLY=${GENERATE_ONLY:-false}
 
 PG_DUMP_NAMESPACE="default"
 PG_DUMP_HOSTPATH="$EXPORT_DIR/pg_dumps"
@@ -159,6 +160,19 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     echo "    container_name: $release"
   } > "$out_compose"
 
+  # --- ENVIRONMENT VARIABLES ---
+  num_envs=$($YQ_BIN e '.containerEnvironmentVariables | length' "$cleaned_file" 2>/dev/null || echo 0)
+  if [[ "$num_envs" -gt 0 ]]; then
+    echo "    environment:" >> "$out_compose"
+    for i in $(seq 0 $((num_envs - 1))); do
+      env_name=$($YQ_BIN e ".containerEnvironmentVariables[$i].name" "$cleaned_file")
+      env_value=$($YQ_BIN e ".containerEnvironmentVariables[$i].value" "$cleaned_file")
+      if [[ -n "$env_name" && "$env_name" != "null" ]]; then
+        echo "      $env_name: \"$env_value\"" >> "$out_compose"
+      fi
+    done
+  fi
+
   # --- PORTS ---
   ports_list=()
   num_ports=$($YQ_BIN e '.portForwardingList | length' "$cleaned_file" 2>/dev/null || echo 0)
@@ -192,6 +206,33 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
   declare -A seen=()
   hostpaths_list=()
 
+  # --- emptyDirVolumes ---
+  num_emptydir_volumes=$($YQ_BIN e '.emptyDirVolumes | length' "$cleaned_file" 2>/dev/null || echo 0)
+  if [[ "$num_emptydir_volumes" -gt 0 ]]; then
+    for i in $(seq 0 $((num_emptydir_volumes - 1))); do
+      mountPath=$($YQ_BIN e ".emptyDirVolumes[$i].mountPath // \"\"" "$cleaned_file")
+      if [[ -n "$mountPath" && "$mountPath" != "null" && -z "${seen[$mountPath]+x}" ]]; then
+        # For emptyDir, use tmpfs for ephemeral storage
+        sizeLimit=$($YQ_BIN e ".emptyDirVolumes[$i].sizeLimit // \"\"" "$cleaned_file")
+        echo "      - type: tmpfs" >> "$out_compose"
+        echo "        target: $mountPath" >> "$out_compose"
+        if [[ -n "$sizeLimit" && "$sizeLimit" != "null" ]]; then
+          # Convert sizeLimit to docker-compose format (e.g., 1Gi -> 1g, 512Mi -> 512m)
+          if [[ "$sizeLimit" =~ ^([0-9]+)Gi$ ]]; then
+            size_val="${BASH_REMATCH[1]}"
+            sizeLimit="${size_val}g"
+          elif [[ "$sizeLimit" =~ ^([0-9]+)Mi$ ]]; then
+            size_val="${BASH_REMATCH[1]}"
+            sizeLimit="${size_val}m"
+          fi
+          echo "        tmpfs:" >> "$out_compose"
+          echo "          size: $sizeLimit" >> "$out_compose"
+        fi
+        seen[$mountPath]=1
+      fi
+    done
+  fi
+
   # 1. persistence volumes
   if [[ "$($YQ_BIN e 'has("persistence")' "$cleaned_file")" == "true" ]]; then
     mapfile -t keys < <($YQ_BIN e '.persistence | keys | .[]' "$cleaned_file" | sed 's/"//g')
@@ -213,8 +254,13 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     for i in $(seq 0 $((num_hostpath_volumes - 1))); do
       hostPath=$($YQ_BIN e ".hostPathVolumes[$i].hostPath // \"\"" "$cleaned_file")
       mountPath=$($YQ_BIN e ".hostPathVolumes[$i].mountPath // \"\"" "$cleaned_file")
+      readOnly=$($YQ_BIN e ".hostPathVolumes[$i].readOnly // false" "$cleaned_file")
       if [[ -n "$hostPath" && "$hostPath" != "null" && "$mountPath" != "null" && -z "${seen[$hostPath]+x}" ]]; then
-        echo "      - \"$hostPath:$mountPath\"" >> "$out_compose"
+        if [[ "$readOnly" == "true" ]]; then
+          echo "      - \"$hostPath:$mountPath:ro\"" >> "$out_compose"
+        else
+          echo "      - \"$hostPath:$mountPath\"" >> "$out_compose"
+        fi
         seen[$hostPath]=1
         hostpaths_list+=("$hostPath")
       fi
@@ -232,7 +278,131 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     fi
   done
 
+  # --- CPUS ---
+  cpu_limit=$($YQ_BIN e '.resources.limits.cpu // .cpuLimit // "0"' "$cleaned_file")
+  # Normalize cpu_limit (e.g., "500m" -> "0.5")
+  if [[ "$cpu_limit" =~ ^[0-9]+m$ ]]; then
+    cpu_val=$(echo "$cpu_limit" | sed 's/m$//')
+    cpu_limit=$(awk "BEGIN {printf \"%.3f\", $cpu_val/1000}")
+  fi
+  echo "    cpus: $cpu_limit" >> "$out_compose"
+
+  # --- MEMORY ---
+  mem_limit=$($YQ_BIN e '.resources.limits.memory // .memLimit // "0"' "$cleaned_file")
+  # Normalize mem_limit (e.g., "512Mi" -> "512m", "2Gi" -> "2048m")
+  if [[ "$mem_limit" =~ ^([0-9]+)Mi$ ]]; then
+    mem_val="${BASH_REMATCH[1]}"
+    mem_limit="${mem_val}m"
+  elif [[ "$mem_limit" =~ ^([0-9]+)Gi$ ]]; then
+    mem_val="${BASH_REMATCH[1]}"
+    mem_limit="${mem_val}g"
+  fi
+  echo "    mem_limit: $mem_limit" >> "$out_compose"
+
+  # --- GPU SUPPORT ---
+  if [[ "$($YQ_BIN e 'has("gpuConfiguration")' "$cleaned_file")" == "true" ]]; then
+    mapfile -t gpu_keys < <($YQ_BIN e '.gpuConfiguration | keys | .[]' "$cleaned_file" | sed 's/"//g')
+    for gpu_key in "${gpu_keys[@]}"; do
+      gpu_count=$($YQ_BIN e ".gpuConfiguration.\"$gpu_key\"" "$cleaned_file")
+      if [[ "$gpu_count" != "null" && "$gpu_count" -gt 0 ]]; then
+        case "$gpu_key" in
+          nvidia.com/gpu)
+            echo "    deploy:" >> "$out_compose"
+            echo "      resources:" >> "$out_compose"
+            echo "        reservations:" >> "$out_compose"
+            echo "          devices:" >> "$out_compose"
+            echo "            - driver: nvidia" >> "$out_compose"
+            echo "              count: $gpu_count" >> "$out_compose"
+            echo "              capabilities: [gpu]" >> "$out_compose"
+            ;;
+          amd.com/gpu)
+            echo "    # AMD GPU requested: $gpu_count (manual configuration may be required)" >> "$out_compose"
+            ;;
+          gpu.intel.com/i915)
+            echo "    # Intel GPU requested: $gpu_count (manual configuration may be required)" >> "$out_compose"
+            ;;
+          *)
+            echo "    # Unknown GPU key: $gpu_key count: $gpu_count" >> "$out_compose"
+            ;;
+        esac
+      fi
+    done
+  fi
+
+  # --- SECURITY CONTEXT ---
+  if [[ "$($YQ_BIN e 'has("securityContext")' "$cleaned_file")" == "true" ]]; then
+    runAsUser=$($YQ_BIN e '.securityContext.runAsUser // ""' "$cleaned_file")
+    runAsGroup=$($YQ_BIN e '.securityContext.runAsGroup // ""' "$cleaned_file")
+    privileged=$($YQ_BIN e '.securityContext.privileged // false' "$cleaned_file")
+    capabilities=$($YQ_BIN e '.securityContext.capabilities // []' "$cleaned_file")
+    enableRunAsUser=$($YQ_BIN e '.securityContext.enableRunAsUser // false' "$cleaned_file")
+
+    # Add user/group if set
+    if [[ -n "$runAsUser" && "$runAsUser" != "null" ]]; then
+      echo "    user: \"$runAsUser\"" >> "$out_compose"
+    fi
+    # Add privileged if true
+    if [[ "$privileged" == "true" ]]; then
+      echo "    privileged: true" >> "$out_compose"
+    fi
+    # Add group_add if runAsGroup is set
+    if [[ -n "$runAsGroup" && "$runAsGroup" != "null" ]]; then
+      echo "    group_add:" >> "$out_compose"
+      echo "      - \"$runAsGroup\"" >> "$out_compose"
+    fi
+    # Add capabilities if not empty
+    cap_count=$($YQ_BIN e '.securityContext.capabilities | length' "$cleaned_file" 2>/dev/null || echo 0)
+    if [[ "$cap_count" -gt 0 ]]; then
+      echo "    cap_add:" >> "$out_compose"
+      for ((k=0; k<cap_count; k++)); do
+        cap=$($YQ_BIN e ".securityContext.capabilities[$k]" "$cleaned_file")
+        if [[ -n "$cap" && "$cap" != "null" ]]; then
+          echo "      - $cap" >> "$out_compose"
+        fi
+      done
+    fi
+  fi
+
+  # --- STDIN/TTY ---
+  stdin=$($YQ_BIN e '.stdin // false' "$cleaned_file")
+  tty=$($YQ_BIN e '.tty // false' "$cleaned_file")
+  if [[ "$stdin" == "true" ]]; then
+    echo "    stdin_open: true" >> "$out_compose"
+  fi
+  if [[ "$tty" == "true" ]]; then
+    echo "    tty: true" >> "$out_compose"
+  fi
+
   echo "    restart: unless-stopped" >> "$out_compose"
+
+  # --- EXTERNAL INTERFACES (static IPs) ---
+  num_ext_ifaces=$($YQ_BIN e '.externalInterfaces | length' "$cleaned_file" 2>/dev/null || echo 0)
+  if [[ "$num_ext_ifaces" -gt 0 ]]; then
+    for i in $(seq 0 $((num_ext_ifaces - 1))); do
+      num_static_ips=$($YQ_BIN e ".externalInterfaces[$i].ipam.staticIPConfigurations | length" "$cleaned_file" 2>/dev/null || echo 0)
+      if [[ "$num_static_ips" -gt 0 ]]; then
+        for j in $(seq 0 $((num_static_ips - 1))); do
+          static_ip=$($YQ_BIN e ".externalInterfaces[$i].ipam.staticIPConfigurations[$j]" "$cleaned_file")
+          if [[ -n "$static_ip" && "$static_ip" != "null" ]]; then
+            echo "    networks:" >> "$out_compose"
+            echo "      lan-ipv4:" >> "$out_compose"
+            echo "        ipv4_address: \"${static_ip%%/*}\"" >> "$out_compose"
+            last_octet=$(echo "${static_ip%%/*}" | awk -F. '{print $4}')
+            hex_octet=$(printf "%02x" "$last_octet")
+            echo "        mac_address: \"02:00:10:02:03:${hex_octet}\"" >> "$out_compose"
+          fi
+        done
+      fi
+    done
+  fi
+
+  if [[ "$num_ext_ifaces" -gt 0 ]]; then
+    echo "" >> "$out_compose"
+    echo "networks:" >> "$out_compose"
+    echo "  lan-ipv4:" >> "$out_compose"
+    echo "    name: lan-ipv4" >> "$out_compose"
+    echo "    external: true" >> "$out_compose"
+  fi
 
   service_host="$release-cnpg-main-rw.$ns.svc.cluster.local"
   docker_compose_cmd="cd $app_dir && docker compose up -d"
