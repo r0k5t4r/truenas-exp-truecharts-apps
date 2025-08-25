@@ -160,6 +160,23 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     echo "    container_name: $release"
   } > "$out_compose"
 
+  # --- COMMAND ---
+  container_command=$($YQ_BIN e '.containerCommand // []' "$cleaned_file" | grep -v 'null' | grep -v '\[\]' || true)
+  if [[ -n "$container_command" ]]; then
+    $YQ_BIN e '.containerCommand[]' "$cleaned_file" | while read -r cmd; do
+      echo "    entrypoint: \"$cmd\"" >> "$out_compose"
+    done
+  fi
+
+  # --- ARGS ---
+  container_args=$($YQ_BIN e '.containerArgs // []' "$cleaned_file" | grep -v 'null' | grep -v '\[\]' || true)
+  if [[ -n "$container_args" ]]; then
+    echo "    command:" >> "$out_compose"
+    $YQ_BIN e '.containerArgs[]' "$cleaned_file" | while read -r arg; do
+      echo "      - \"$arg\"" >> "$out_compose"
+    done
+  fi
+
   # --- ENVIRONMENT VARIABLES ---
   num_envs=$($YQ_BIN e '.containerEnvironmentVariables | length' "$cleaned_file" 2>/dev/null || echo 0)
   if [[ "$num_envs" -gt 0 ]]; then
@@ -168,7 +185,7 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
       env_name=$($YQ_BIN e ".containerEnvironmentVariables[$i].name" "$cleaned_file")
       env_value=$($YQ_BIN e ".containerEnvironmentVariables[$i].value" "$cleaned_file")
       if [[ -n "$env_name" && "$env_name" != "null" ]]; then
-        echo "      $env_name: \"$env_value\"" >> "$out_compose"
+        echo "      - $env_name=$env_value" >> "$out_compose"
       fi
     done
   fi
@@ -339,17 +356,14 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
 
     # Add user/group if set
     if [[ -n "$runAsUser" && "$runAsUser" != "null" ]]; then
-      echo "    user: \"$runAsUser\"" >> "$out_compose"
+      echo "    user: \"$runAsUser:$runAsGroup\"" >> "$out_compose"
+      
     fi
     # Add privileged if true
     if [[ "$privileged" == "true" ]]; then
       echo "    privileged: true" >> "$out_compose"
     fi
-    # Add group_add if runAsGroup is set
-    if [[ -n "$runAsGroup" && "$runAsGroup" != "null" ]]; then
-      echo "    group_add:" >> "$out_compose"
-      echo "      - \"$runAsGroup\"" >> "$out_compose"
-    fi
+
     # Add capabilities if not empty
     cap_count=$($YQ_BIN e '.securityContext.capabilities | length' "$cleaned_file" 2>/dev/null || echo 0)
     if [[ "$cap_count" -gt 0 ]]; then
@@ -375,6 +389,12 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
 
   echo "    restart: unless-stopped" >> "$out_compose"
 
+  # --- NETWORKS ---
+  echo "    networks:" >> "$out_compose"
+  echo "      ix-apps:" >> "$out_compose"
+  echo "        aliases:" >> "$out_compose"
+  echo "          - $release.$ns.svc.cluster.local" >> "$out_compose"
+
   # --- EXTERNAL INTERFACES (static IPs) ---
   num_ext_ifaces=$($YQ_BIN e '.externalInterfaces | length' "$cleaned_file" 2>/dev/null || echo 0)
   if [[ "$num_ext_ifaces" -gt 0 ]]; then
@@ -384,7 +404,6 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
         for j in $(seq 0 $((num_static_ips - 1))); do
           static_ip=$($YQ_BIN e ".externalInterfaces[$i].ipam.staticIPConfigurations[$j]" "$cleaned_file")
           if [[ -n "$static_ip" && "$static_ip" != "null" ]]; then
-            echo "    networks:" >> "$out_compose"
             echo "      lan-ipv4:" >> "$out_compose"
             echo "        ipv4_address: \"${static_ip%%/*}\"" >> "$out_compose"
             last_octet=$(echo "${static_ip%%/*}" | awk -F. '{print $4}')
@@ -396,9 +415,12 @@ find "$EXPORT_DIR" -type f -name cleaned.yaml | while read -r cleaned_file; do
     done
   fi
 
+  echo "" >> "$out_compose"
+  echo "networks:" >> "$out_compose"
+  echo "  ix-apps:" >> "$out_compose"
+  echo "    name: ix-apps" >> "$out_compose"
+  echo "    external: true" >> "$out_compose"
   if [[ "$num_ext_ifaces" -gt 0 ]]; then
-    echo "" >> "$out_compose"
-    echo "networks:" >> "$out_compose"
     echo "  lan-ipv4:" >> "$out_compose"
     echo "    name: lan-ipv4" >> "$out_compose"
     echo "    external: true" >> "$out_compose"
